@@ -1,0 +1,469 @@
+"""
+PostgreSQL State Manager for MCPMark
+=====================================
+
+Manages database state for PostgreSQL tasks including schema setup,
+test data creation, and cleanup.
+"""
+
+import os
+import subprocess
+import sys
+import psycopg2
+from psycopg2 import sql
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+
+from src.base.state_manager import BaseStateManager, InitialStateInfo
+from src.base.task_manager import BaseTask
+from src.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+class PostgresStateManager(BaseStateManager):
+    """Manages PostgreSQL database state for task evaluation."""
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5432,
+        database: str = "postgres",
+        username: str = "postgres",
+        password: str = None,
+    ):
+        """Initialize PostgreSQL state manager.
+
+        Args:
+            host: Database host
+            port: Database port
+            database: Main database name
+            username: Database username
+            password: Database password
+            template_db: Template database for initial states
+        """
+        super().__init__(service_name="postgres")
+
+        self.host = host
+        self.port = port
+        self.database = database
+        self.username = username
+        self.password = password
+
+        # Connection parameters
+        self.conn_params = {
+            "host": host,
+            "port": port,
+            "user": username,
+            "password": password,
+        }
+
+        # Track created databases for cleanup
+        self.created_databases: List[str] = []
+
+        # Track current task database for agent configuration
+        self._current_task_database: Optional[str] = None
+
+        # Validate connection on initialization
+        try:
+            self._test_connection()
+            self._setup_database()
+            logger.info("PostgreSQL state manager initialized successfully")
+        except Exception as e:
+            raise RuntimeError(f"PostgreSQL initialization failed: {e}")
+
+    def _test_connection(self):
+        """Test database connection."""
+        conn = psycopg2.connect(**self.conn_params, database="postgres")
+        conn.close()
+    
+    TEMPLATE_DATABASES = ("employees", "chinook", "dvdrental", "sports", "lego")
+
+    def _validate_template_database(self, db_name: str):
+        """Reject empty templates left behind by an unsuccessful restore."""
+        conn = psycopg2.connect(**self.conn_params, database=db_name)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_tables
+                        WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+                    )
+                """)
+                if not cur.fetchone()[0]:
+                    raise RuntimeError(
+                        f"Template database '{db_name}' has no user tables. "
+                        "Restore its backup before running tasks."
+                    )
+        finally:
+            conn.close()
+
+    def _setup_database(self):
+        """Download and restore templates, failing initialization on any error."""
+        backup_dir = Path(__file__).resolve().parents[3] / "postgres_state"
+
+        for db_name in self.TEMPLATE_DATABASES:
+            if self._database_exists(db_name):
+                self._validate_template_database(db_name)
+                logger.debug(f"{db_name} database already exists")
+                continue
+
+            backup_file = backup_dir / f"{db_name}.backup"
+            if not backup_file.exists():
+                import shutil
+                import urllib.request
+
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                partial_file = backup_file.with_suffix(".backup.part")
+                logger.info(f"Downloading {db_name} backup...")
+                try:
+                    # The storage endpoint rejects urllib's default User-Agent
+                    # with HTTP 403 (Cloudflare 1010); documented wget works.
+                    request = urllib.request.Request(
+                        f"https://storage.mcpmark.ai/postgres/{db_name}.backup",
+                        headers={"User-Agent": "Wget/1.21.4"},
+                    )
+                    with urllib.request.urlopen(request, timeout=60) as response:
+                        with partial_file.open("wb") as output:
+                            shutil.copyfileobj(response, output)
+                    with partial_file.open("rb") as downloaded:
+                        if downloaded.read(5) != b"PGDMP":
+                            raise RuntimeError("Downloaded file is not a PostgreSQL archive")
+                    partial_file.replace(backup_file)
+                except Exception as exc:
+                    partial_file.unlink(missing_ok=True)
+                    raise RuntimeError(f"Failed to download {db_name} backup: {exc}") from exc
+
+            logger.info(f"Setting up {db_name} database...")
+            self._create_empty_database(db_name)
+            env = os.environ.copy()
+            if self.password is not None:
+                env["PGPASSWORD"] = self.password
+            try:
+                result = subprocess.run(
+                    [
+                        "pg_restore",
+                        "-h", str(self.host),
+                        "-p", str(self.port),
+                        "-U", self.username,
+                        "-d", db_name,
+                        "--no-owner", "--no-privileges", "--exit-on-error",
+                        str(backup_file),
+                    ],
+                    env=env, capture_output=True, text=True,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"pg_restore failed for {db_name} (exit {result.returncode}): "
+                        f"{result.stderr}"
+                    )
+                self._validate_template_database(db_name)
+            except Exception:
+                # Only remove the template created by this attempt. Existing
+                # databases are validated above and are never overwritten.
+                self._drop_database(db_name)
+                raise
+            logger.info(f"{db_name} database restored successfully")
+
+    def _create_initial_state(self, task: BaseTask) -> Optional[InitialStateInfo]:
+        """Create initial database state for a task."""
+        try:
+            # Generate unique database name
+            db_name = f"mcpmark_{task.category_id}_{task.task_id}_{self._get_timestamp()}"
+
+            # Sample-data tasks must never silently fall back to an empty DB.
+            template_exists = self._database_exists(task.category_id)
+            if task.category_id in self.TEMPLATE_DATABASES:
+                if not template_exists:
+                    raise RuntimeError(f"Required template database '{task.category_id}' is missing")
+                self._validate_template_database(task.category_id)
+            if template_exists:
+                self._create_database_from_template(db_name, task.category_id)
+                logger.info(
+                    f"| Created database '{db_name}' from template '{task.category_id}'"
+                )
+            else:
+                if not (task.task_instruction_path.parent / "prepare_environment.py").exists():
+                    raise RuntimeError(f"No template or prepare_environment.py for {task.name}")
+                self._create_empty_database(db_name)
+                logger.info(f"| Created empty database '{db_name}'")
+                # Run prepare_environment.py if it exists
+                self._run_prepare_environment(db_name, task)
+                logger.info(f"| Prepared environment for database '{db_name}'")
+
+            # Track for cleanup
+            self.created_databases.append(db_name)
+            self.track_resource("database", db_name, {"task": task.name})
+
+
+            return InitialStateInfo(
+                state_id=db_name,
+                state_url=f"postgresql://{self.username}@{self.host}:{self.port}/{db_name}",
+                metadata={
+                    "database": db_name,
+                    "category": task.category_id,
+                    "task_id": task.task_id,
+                },
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to create initial state for {task.name}: {e}")
+            return None
+
+    def _store_initial_state_info(
+        self, task: BaseTask, state_info: InitialStateInfo
+    ) -> None:
+        """Store database info in task object."""
+        if hasattr(task, "__dict__"):
+            task.database_name = state_info.state_id
+            task.database_url = state_info.state_url
+            # Store current task database for agent configuration
+            self._current_task_database = state_info.state_id
+
+    def _cleanup_task_initial_state(self, task: BaseTask) -> bool:
+        """Clean up task database."""
+        if hasattr(task, "database_name") and task.database_name:
+            try:
+                self._drop_database(task.database_name)
+                logger.info(f"| Dropped database: {task.database_name}")
+
+                # Remove from tracking
+                self.created_databases = [
+                    db for db in self.created_databases if db != task.database_name
+                ]
+                # Clear current task database
+                if self._current_task_database == task.database_name:
+                    self._current_task_database = None
+                return True
+            except Exception as e:
+                logger.error(f"Failed to drop database {task.database_name}: {e}")
+                return False
+        return True
+
+    def _cleanup_single_resource(self, resource: Dict[str, Any]) -> bool:
+        """Clean up a single PostgreSQL resource."""
+        if resource["type"] == "database":
+            try:
+                self._drop_database(resource["id"])
+                logger.info(f"| Dropped database: {resource['id']}")
+                return True
+            except Exception as e:
+                logger.error(f"| Failed to drop database {resource['id']}: {e}")
+                return False
+        return False
+
+    def _database_exists(self, db_name: str) -> bool:
+        """Check if database exists."""
+        conn = psycopg2.connect(**self.conn_params, database="postgres")
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,))
+                return cur.fetchone() is not None
+        finally:
+            conn.close()
+
+    def _create_database_from_template(self, new_db: str, template_db: str):
+        """Create database from template."""
+        conn = psycopg2.connect(**self.conn_params, database="postgres")
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("""
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE datname = %s AND pid <> pg_backend_pid()
+                """),
+                    (template_db,),
+                )
+                cur.execute(
+                    sql.SQL("CREATE DATABASE {} WITH TEMPLATE {}").format(
+                        sql.Identifier(new_db), sql.Identifier(template_db)
+                    )
+                )
+        finally:
+            conn.close()
+
+    def _create_empty_database(self, db_name: str):
+        """Create empty database."""
+        conn = psycopg2.connect(**self.conn_params, database="postgres")
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db_name))
+                )
+        finally:
+            conn.close()
+
+    def _drop_database(self, db_name: str):
+        """Drop database."""
+        conn = psycopg2.connect(**self.conn_params, database="postgres")
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                # Terminate connections
+                cur.execute(
+                    sql.SQL("""
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE datname = %s AND pid <> pg_backend_pid()
+                """),
+                    (db_name,),
+                )
+
+                # Drop database
+                cur.execute(
+                    sql.SQL("DROP DATABASE IF EXISTS {}").format(
+                        sql.Identifier(db_name)
+                    )
+                )
+        finally:
+            conn.close()
+
+    def _run_prepare_environment(self, db_name: str, task: BaseTask):
+        """Run prepare_environment.py script if it exists in the task directory."""
+        # Find the task directory containing prepare_environment.py
+        task_dir = task.task_instruction_path.parent
+        prepare_script = task_dir / "prepare_environment.py"
+
+        if not prepare_script.exists():
+            logger.debug(f"No prepare_environment.py found for task {task.name}")
+            return
+
+        logger.info(f"| Running prepare_environment.py for task {task.name}")
+
+        # Set up environment variables for the script
+        env = os.environ.copy()
+        env.update({
+            "POSTGRES_HOST": str(self.host),
+            "POSTGRES_PORT": str(self.port),
+            "POSTGRES_DATABASE": db_name,
+            "POSTGRES_USERNAME": self.username,
+            "POSTGRES_PASSWORD": self.password or "",
+        })
+
+        try:
+            # Run the prepare_environment.py script
+            result = subprocess.run(
+                [sys.executable, str(prepare_script)],
+                cwd=str(task_dir),  # Run from task directory to access data/ folder
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=300,  # 5 minute timeout
+            )
+
+            if result.returncode == 0:
+                logger.info(f"| ✓ Environment preparation completed for {task.name}")
+                if result.stdout.strip():
+                    logger.debug(f"| prepare_environment.py output: {result.stdout}")
+            else:
+                logger.error(f"| ❌ Environment preparation failed for {task.name}")
+                logger.error(f"| Error output: {result.stderr}")
+                raise RuntimeError(f"prepare_environment.py failed with exit code {result.returncode}")
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"❌ Environment preparation timed out for {task.name}")
+            raise RuntimeError("prepare_environment.py execution timed out")
+        except Exception as e:
+            logger.error(f"❌ Failed to run prepare_environment.py for {task.name}: {e}")
+            raise
+
+    def _setup_task_specific_data(self, db_name: str, task: BaseTask):
+        """Set up task-specific schema and data."""
+        conn = psycopg2.connect(**self.conn_params, database=db_name)
+        try:
+            with conn.cursor() as cur:
+                if task.category_id == "basic_queries":
+                    self._setup_basic_queries_data(cur)
+                elif task.category_id == "data_manipulation":
+                    self._setup_data_manipulation_data(cur)
+                elif task.category_id == "table_operations":
+                    self._setup_table_operations_data(cur)
+                # Add more categories as needed
+
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to setup task data: {e}")
+            raise
+        finally:
+            conn.close()
+
+    def _setup_basic_queries_data(self, cursor):
+        """Set up data for basic query tasks."""
+        cursor.execute("""
+            CREATE TABLE employees (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                department VARCHAR(50),
+                salary DECIMAL(10, 2),
+                hire_date DATE
+            );
+
+            INSERT INTO employees (name, department, salary, hire_date) VALUES
+            ('John Doe', 'Engineering', 75000.00, '2020-01-15'),
+            ('Jane Smith', 'Marketing', 65000.00, '2019-03-22'),
+            ('Bob Johnson', 'Engineering', 80000.00, '2018-07-01'),
+            ('Alice Brown', 'HR', 55000.00, '2021-02-10');
+        """)
+
+    def _setup_data_manipulation_data(self, cursor):
+        """Set up data for data manipulation tasks."""
+        cursor.execute("""
+            CREATE TABLE products (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                category VARCHAR(50),
+                price DECIMAL(10, 2),
+                stock INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE orders (
+                id SERIAL PRIMARY KEY,
+                product_id INTEGER REFERENCES products(id),
+                quantity INTEGER NOT NULL,
+                order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+    def _setup_table_operations_data(self, cursor):
+        """Set up for table operation tasks."""
+        # Start with minimal schema that tasks will modify
+        cursor.execute("""
+            CREATE TABLE test_table (
+                id SERIAL PRIMARY KEY,
+                data VARCHAR(255)
+            );
+        """)
+
+    def _get_timestamp(self) -> str:
+        """Get timestamp for unique naming."""
+        from datetime import datetime
+
+        return datetime.now().strftime("%Y%m%d%H%M%S")
+
+    def get_service_config_for_agent(self) -> dict:
+        """Get configuration for agent execution."""
+        config = {
+            "host": self.host,
+            "port": self.port,
+            "username": self.username,
+            "password": self.password,
+        }
+
+        # If there's a current task database, include it
+        if hasattr(self, "_current_task_database") and self._current_task_database:
+            config["current_database"] = self._current_task_database
+            config["database_url"] = (
+                f"postgresql://{self.username}:{self.password}@{self.host}:{self.port}/{self._current_task_database}"
+            )
+        else:
+            # Fallback to default database
+            config["database"] = self.database
+            config["database_url"] = (
+                f"postgresql://{self.username}:{self.password}@{self.host}:{self.port}/{self.database}"
+            )
+
+        return config

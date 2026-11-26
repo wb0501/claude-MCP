@@ -1,0 +1,45 @@
+# --- Claude MCPMark runner: excluded artifacts -----------------------------
+# Environment / credentials
+.mcp_env
+.env
+.env.*
+.aws/
+.codex/
+*.pem
+*_identity
+id_rsa*
+
+# Runtime state and experiment outputs
+results/
+results_*/
+github_state/
+postgres_state/
+notion_state.json
+.mcpmark-bin/
+.mcpmark_backups/
+.playwright-mcp/
+test_environments/
+notion_thinking_review_*/
+*.zip
+*.pcap
+*.pcapng
+*.jsonl
+*.log
+
+# Virtual environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+*.pkl
+.ruff_cache/
+.cache/
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+
+# Local editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

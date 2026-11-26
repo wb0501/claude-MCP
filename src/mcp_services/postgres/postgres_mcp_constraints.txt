@@ -1,0 +1,2 @@
+# postgres-mcp 0.3.0 uses the MCP 1.x FastMCP API.
+mcp==1.30.0
