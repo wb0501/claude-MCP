@@ -100,7 +100,7 @@ docker run -d \
   --network mcp-network \
   -e POSTGRES_DATABASE=postgres \
   -e POSTGRES_USER=postgres \
-  -e POSTGRES_PASSWORD=123456 \
+  -e POSTGRES_PASSWORD=your-password \
   ghcr.io/cloudnative-pg/postgresql:17-bookworm
 
 # Run postgres task
